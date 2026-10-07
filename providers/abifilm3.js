@@ -550,7 +550,7 @@ function sbDeclNames(code) {
 
 function sbNew(embedUrl, pageUrl) {
   var rec = [], trace = [], errs = [], reqs = [], queue = [], fired = 0, depth = 0;
-  var G = {};
+  var G = {}, missing = [];
   var host = (String(embedUrl).match(/^https?:\/\/([^\/?#]+)/) || [])[1] || '';
   var NAMES = ['window', 'document', 'navigator', 'location', '$', 'jQuery', 'jwplayer', 'Hls', 'videojs', 'player',
     'localStorage', 'sessionStorage', 'screen', 'history', 'XMLHttpRequest', 'setTimeout', 'setInterval',
@@ -576,7 +576,7 @@ function sbNew(embedUrl, pageUrl) {
     var n = 0;
     while (queue.length && n++ < 400) {
       var f = queue.shift();
-      try { f(); } catch (e) { errs.push('cb:' + (e && e.message)); }
+      try { f(); } catch (e) { errs.push('cb:' + (e && e.message)); var mn = sbMissingName(e); if (mn) missing.push(mn); }
     }
   }
   function mk(name, init) {
@@ -706,6 +706,37 @@ function sbNew(embedUrl, pageUrl) {
       try { execCode(code, false); } catch (e) { errs.push('run:' + (e && e.message)); }
     },
     drain: drain,
+    runAll: function (scripts) {
+      var ok = [], attempt;
+      function errFn(i, e) {
+        errs.push('s' + i + ':' + String((e && e.message) || e).slice(0, 90));
+        var nm = sbMissingName(e);
+        if (nm) missing.push(nm);
+      }
+      scripts.forEach(function (sc, i) {
+        var t = String(sc).replace(/(^|[^\w$.])Function\s*\(/g, '$1__Fn(')
+          .replace(/(^|[;{}\s(])(?:let|const)\s+(?=[A-Za-z_$\[{])/g, '$1var ');
+        try { Function(t); ok.push(t); } catch (se) { errs.push('syn' + i + ':' + (se && se.message)); }
+      });
+      var body = ok.map(function (t, i) { return 'try{\n' + t + '\n}catch(__e){__err(' + i + ',__e)}'; }).join('\n');
+      for (attempt = 1; attempt <= 12; attempt++) {
+        errs.length = 0; queue.length = 0; fired = 0; reqs.length = 0; trace.length = 0; missing.length = 0;
+        var keys = Object.keys(G).filter(sbValidName), fn;
+        try {
+          fn = Function.apply(null, NAMES.concat(['__Fn', 'atob', 'btoa', '__err']).concat(keys).concat([body]));
+        } catch (be) { errs.push('build:' + (be && be.message)); break; }
+        try {
+          fn.apply(win, vals.concat([sbFn, sbAtob, sbBtoa, errFn]).concat(keys.map(function (k) { return G[k]; })));
+        } catch (re) { errFn(-1, re); }
+        drain();
+        var added = false;
+        missing.forEach(function (nm) {
+          if (sbValidName(nm) && NAMES.indexOf(nm) === -1 && !Object.prototype.hasOwnProperty.call(G, nm)) { G[nm] = mk(nm); added = true; }
+        });
+        if (!added) break;
+      }
+      return attempt;
+    },
     feed: function (r, text) {
       rec.push(text);
       var o = r.opts || {}, data = text;
@@ -743,38 +774,56 @@ function sbRequests(box, embedUrl, label) {
   }));
 }
 
+function sbDirectEvalOk() {
+  try { return (function () { var q = 1; return eval('q+1') === 2; })(); } catch (e) { return false; }
+}
+
+function sbCollect(box, skip) {
+  var urls = [], seen = {};
+  box.rec.forEach(function (x) {
+    var t = hexUnescape(String(x)).replace(/&amp;/g, '&');
+    (t.match(/https?:\/\/[^\s"'<>\\)\]]+/g) || []).forEach(function (u) {
+      u = u.replace(/[,;]+$/, '');
+      if (seen[u] || u === skip || BAD_EXT.test(u)) return;
+      if (/googleapis|gstatic|jquery|cdnjs|jsdelivr|jwplayer|jwpcdn|schema\.org|w3\.org|youtube|cloudflare|google/i.test(u)) return;
+      seen[u] = true; urls.push(u);
+    });
+  });
+  var good = urls.filter(function (u) { return /\.m3u8|master|\.mp4|\.txt(\?|$)|rapidrame|playmix|\/hls/i.test(u); });
+  function rank(u) { return /\.m3u8/i.test(u) ? 0 : (/master/i.test(u) ? 1 : 2); }
+  good.sort(function (a, b) { return rank(a) - rank(b); });
+  return good;
+}
+
 function sandboxFind(html, embedUrl, pageUrl, skip, label) {
   var scripts = [], re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi, m;
   while ((m = re.exec(html)) !== null) {
     if (/\ssrc\s*=/.test(m[1]) || /ld\+json|application\/json/i.test(m[1])) continue;
     if (m[2].trim().length > 20) scripts.push(m[2]);
   }
-  var box = sbNew(embedUrl, pageUrl);
-  scripts.forEach(function (sc) { box.run(sc); });
-  box.drain();
 
-  return sbRequests(box, embedUrl, label).then(function () {
-    var urls = [], seen = {};
-    box.rec.forEach(function (x) {
-      var t = hexUnescape(String(x)).replace(/&amp;/g, '&');
-      (t.match(/https?:\/\/[^\s"'<>\\)\]]+/g) || []).forEach(function (u) {
-        u = u.replace(/[,;]+$/, '');
-        if (seen[u] || u === skip || BAD_EXT.test(u)) return;
-        if (/googleapis|gstatic|jquery|cdnjs|jsdelivr|jwplayer|jwpcdn|schema\.org|w3\.org|youtube|cloudflare|google/i.test(u)) return;
-        seen[u] = true; urls.push(u);
-      });
+  function pass(mode) {
+    var box = sbNew(embedUrl, pageUrl), tag = (mode === 'uni' ? 'SB2 ' : 'SB '), info = '';
+    if (mode === 'sep') { scripts.forEach(function (sc) { box.run(sc); }); box.drain(); }
+    else info = ' deneme ' + box.runAll(scripts);
+    return sbRequests(box, embedUrl, label + (mode === 'uni' ? 'U' : '')).then(function () {
+      var good = sbCollect(box, skip);
+      dbg.push(tag + label + ' betik ' + scripts.length + ' kayit ' + box.rec.length + ' istek ' + box.reqs.length +
+        ' aday ' + good.length + info + (box.errs.length ? ' hata ' + box.errs.slice(0, 3).join('|').slice(0, 170) : ''));
+      good.slice(0, 3).forEach(function (u) { dbg.push(tag + 'A ' + label + ' ' + u.slice(0, 130)); });
+      if (!good.length) {
+        var key = box.trace.filter(function (t) { return /setup|ajax|file|src|http|source|play/i.test(t); });
+        (key.length ? key : box.trace).slice(0, 8).forEach(function (t) { dbg.push(tag + 'T ' + label + ' ' + t.slice(0, 130)); });
+      }
+      return good;
     });
-    var good = urls.filter(function (u) { return /\.m3u8|master|\.mp4|\.txt(\?|$)|rapidrame|playmix|\/hls/i.test(u); });
-    function rank(u) { return /\.m3u8/i.test(u) ? 0 : (/master/i.test(u) ? 1 : 2); }
-    good.sort(function (a, b) { return rank(a) - rank(b); });
+  }
 
-    dbg.push('SB ' + label + ' betik ' + scripts.length + ' kayit ' + box.rec.length + ' istek ' + box.reqs.length + ' aday ' + good.length +
-      (box.errs.length ? ' hata ' + box.errs.slice(0, 3).join('|').slice(0, 150) : ''));
-    good.slice(0, 3).forEach(function (u) { dbg.push('SB A ' + label + ' ' + u.slice(0, 130)); });
-    if (!good.length) {
-      var key = box.trace.filter(function (t) { return /setup|ajax|file|src|http|source|play/i.test(t); });
-      (key.length ? key : box.trace).slice(0, 8).forEach(function (t) { dbg.push('SB T ' + label + ' ' + t.slice(0, 130)); });
-    }
+  return pass('sep').then(function (g) {
+    if (g.length) return g;
+    if (!sbDirectEvalOk()) { dbg.push('SB ' + label + ' direct eval yok'); return g; }
+    return pass('uni');
+  }).then(function (good) {
     return good.map(function (u) { return { url: u, type: /\.mp4(\?|$)/i.test(u) ? 'mp4' : 'hls', quality: 'Auto' }; });
   });
 }
