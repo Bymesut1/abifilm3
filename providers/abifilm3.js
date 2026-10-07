@@ -6,7 +6,7 @@ var SITE_AYARLARI = {
   PRIMARY_DOMAIN: 'https://filmmakinesi.to',
   EKLENTI_ADI: 'abifilm3',
   // true iken akış bulunamazsa nedenini yazan "DEBUG" satırları çıkar. Her şey çalışınca false yap.
-  DEBUG_MODU: true
+  DEBUG_MODU: false
 };
 
 var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
@@ -900,8 +900,8 @@ function resolveEmbed(embedUrl, pageUrl, label) {
 
 function makeStream(label, r) {
   return {
-    name: SITE_AYARLARI.EKLENTI_ADI,
-    title: label,
+    name: label,
+    title: SITE_AYARLARI.EKLENTI_ADI + ' - ' + label,
     url: r.url,
     quality: r.quality || 'Auto',
     type: r.type,
