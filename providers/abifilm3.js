@@ -422,12 +422,11 @@ function embedDiag(label, html, texts) {
   var i = t.search(/av\s*\(|atob\(|m3u8|"file"/);
   if (i > -1) dbg.push('EM ipucu: ' + t.substr(Math.max(0, i - 40), 160).replace(/\s+/g, ' '));
   dbg.push('EM paketLen ' + t.length);
-  var dumpFrom = Math.max(0, t.search(/atob\(/) - 700);
-  for (var ci = 0; ci < 10; ci++) {
-    var chunk = t.substr(dumpFrom + ci * 320, 320).replace(/\s+/g, ' ');
-    if (!chunk) break;
-    dbg.push('EM K' + ci + ': ' + chunk);
-  }
+  [1, 2, 3, 6, 10].forEach(function (ci) {
+    var chunk = t.substr(ci * 320, 320).replace(/\s+/g, ' ');
+    if (chunk) dbg.push('EM K' + ci + ': ' + chunk);
+  });
+  dbg.push('EM Z: ' + t.slice(-160).replace(/\s+/g, ' '));
   var ss = html.lastIndexOf('<script');
   if (ss > -1) dbg.push('EM son: ' + html.substr(ss, 160).replace(/\s+/g, ' '));
 }
@@ -480,6 +479,7 @@ function verifyStream(r, label, origin) {
       dbg.push('V ' + label + ' h' + i + ' ' + p.status + ' ' + head);
       if (p.status === 200 && /^\s*#EXTM3U/.test(p.text)) {
         r.headers = variants[i];
+        r.ok = true;
         // ikinci seviye: ilk alt liste / ilk parça erişilebiliyor mu
         var u1 = firstUri(p.text);
         if (!u1) return r;
@@ -500,6 +500,164 @@ function verifyStream(r, label, origin) {
   return tryAt(0);
 }
 
+
+// ---------------- Mini JS sandbox (şifreli embed betiklerini çalıştırıp URL yakalar) ----------------
+
+function sbBtoa(str) {
+  var out = '', i = 0, a, b, c;
+  str = String(str);
+  while (i < str.length) {
+    a = str.charCodeAt(i++) & 255;
+    b = i < str.length ? str.charCodeAt(i++) & 255 : NaN;
+    c = i < str.length ? str.charCodeAt(i++) & 255 : NaN;
+    out += B64.charAt(a >> 2) + B64.charAt(((a & 3) << 4) | ((isNaN(b) ? 0 : b) >> 4)) +
+      (isNaN(b) ? '=' : B64.charAt(((b & 15) << 2) | ((isNaN(c) ? 0 : c) >> 6))) +
+      (isNaN(c) ? '=' : B64.charAt(c & 63));
+  }
+  return out;
+}
+function sbAtob(s) { return bytesToStr(b64ToBytes(s)); }
+
+function sbNew(embedUrl, pageUrl) {
+  var rec = [], trace = [], errs = [], depth = 0, fired = 0;
+  var host = (String(embedUrl).match(/^https?:\/\/([^\/?#]+)/) || [])[1] || '';
+  var NAMES = ['window', 'document', 'navigator', 'location', '$', 'jQuery', 'jwplayer', 'Hls', 'videojs', 'player',
+    'localStorage', 'sessionStorage', 'screen', 'history', 'XMLHttpRequest', 'setTimeout', 'setInterval',
+    'self', 'top', 'parent', 'globalThis', 'Image', 'Audio'];
+
+  function pv(v) {
+    try {
+      if (typeof v === 'string') return v.slice(0, 90);
+      if (typeof v === 'function') return 'fn';
+      return JSON.stringify(v).slice(0, 90);
+    } catch (e) { return '?'; }
+  }
+  function add(v) {
+    try {
+      if (typeof v === 'string') rec.push(v);
+      else if (v && typeof v === 'object') rec.push(JSON.stringify(v));
+    } catch (e) {}
+  }
+  function fire(fn) {
+    if (fired++ > 150 || depth > 6) return;
+    depth++;
+    try { fn(); } catch (e) { errs.push('cb:' + (e && e.message)); }
+    depth--;
+  }
+  function mk(name, init) {
+    var store = init || {}, kids = {};
+    function handleArgs(args) {
+      if (trace.length < 40) trace.push(name + '(' + args.map(pv).join(',') + ')');
+      for (var i = 0; i < args.length; i++) {
+        if (typeof args[i] === 'function') fire(args[i]); else add(args[i]);
+      }
+    }
+    return new Proxy(function () {}, {
+      get: function (t, k) {
+        if (typeof k === 'symbol') return k === Symbol.toPrimitive ? function () { return ''; } : undefined;
+        if (k === 'toString' || k === 'toJSON') return function () { return ''; };
+        if (k === 'valueOf') return function () { return 0; };
+        if (k === 'then') return undefined;
+        if (k === 'length') return 0;
+        if (Object.prototype.hasOwnProperty.call(store, k)) return store[k];
+        if (!kids[k]) kids[k] = mk(name + '.' + k);
+        return kids[k];
+      },
+      set: function (t, k, v) {
+        store[k] = v;
+        if (typeof v === 'function') fire(v);
+        else { if (trace.length < 40) trace.push(name + '.' + String(k) + '=' + pv(v)); add(v); }
+        return true;
+      },
+      apply: function (t, th, args) { handleArgs(args); return mk(name + '()'); },
+      construct: function (t, args) { handleArgs(args); return mk(name + '#'); }
+    });
+  }
+
+  function rewrite(code) {
+    return String(code).replace(/\beval\s*\(/g, '__ev(').replace(/(^|[^\w$.])Function\s*\(/g, '$1__Fn(');
+  }
+  function build(params, code, asExpr) {
+    var all = NAMES.concat(['__ev', '__Fn', 'atob', 'btoa']).concat(params || []);
+    var body = rewrite(code);
+    all.push(asExpr ? 'return (' + body + '\n);' : body);
+    return Function.apply(null, all);
+  }
+  var win, vals;
+  function call(fn, extra) {
+    return fn.apply(win, vals.concat([sbEval, sbFn, sbAtob, sbBtoa]).concat(extra || []));
+  }
+  function sbEval(code) {
+    if (typeof code !== 'string') return code;
+    rec.push(code);
+    if (depth > 6) return undefined;
+    depth++;
+    try {
+      var fn;
+      try { fn = build([], code, true); } catch (se) { fn = build([], code, false); }
+      return call(fn);
+    } catch (e) { errs.push('ev:' + (e && e.message)); return undefined; }
+    finally { depth--; }
+  }
+  function sbFn() {
+    var a = Array.prototype.slice.call(arguments), body = String(a.length ? a.pop() : ''), params = [];
+    rec.push(body);
+    a.forEach(function (x) { String(x).split(',').forEach(function (q) { q = q.trim(); if (q) params.push(q); }); });
+    var fn = build(params, body, false);
+    return function () { return call(fn, Array.prototype.slice.call(arguments)); };
+  }
+
+  var doc = mk('document', { referrer: pageUrl, cookie: '', URL: embedUrl, domain: host, readyState: 'complete' });
+  var nav = mk('navigator', { userAgent: ANDROID_UA, platform: 'Linux armv8l', language: 'tr-TR', webdriver: false });
+  var loc = mk('location', { href: embedUrl, hostname: host, host: host, origin: originOf(embedUrl), protocol: 'https:', pathname: '/' });
+  win = mk('window', { atob: sbAtob, btoa: sbBtoa, eval: sbEval, Function: sbFn, document: doc, navigator: nav, location: loc });
+  vals = NAMES.map(function (n) {
+    if (n === 'window' || n === 'self' || n === 'top' || n === 'parent' || n === 'globalThis') return win;
+    if (n === 'document') return doc;
+    if (n === 'navigator') return nav;
+    if (n === 'location') return loc;
+    return mk(n);
+  });
+
+  return {
+    rec: rec, trace: trace, errs: errs,
+    run: function (code) {
+      try { call(build([], code, false)); } catch (e) { errs.push('run:' + (e && e.message)); }
+    }
+  };
+}
+
+function sandboxFind(html, embedUrl, pageUrl, skip, label) {
+  var scripts = [], re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi, m;
+  while ((m = re.exec(html)) !== null) {
+    if (/\ssrc\s*=/.test(m[1]) || /ld\+json|application\/json/i.test(m[1])) continue;
+    if (m[2].trim().length > 20) scripts.push(m[2]);
+  }
+  var box = sbNew(embedUrl, pageUrl);
+  scripts.forEach(function (sc) { box.run(sc); });
+
+  var urls = [], seen = {};
+  box.rec.forEach(function (x) {
+    var t = hexUnescape(String(x)).replace(/&amp;/g, '&');
+    (t.match(/https?:\/\/[^\s"'<>\\)\]]+/g) || []).forEach(function (u) {
+      u = u.replace(/[,;]+$/, '');
+      if (seen[u] || u === skip || BAD_EXT.test(u)) return;
+      if (/googleapis|gstatic|jquery|cdnjs|jsdelivr|jwplayer|jwpcdn|schema\.org|w3\.org|youtube|cloudflare|google/i.test(u)) return;
+      seen[u] = true; urls.push(u);
+    });
+  });
+  var good = urls.filter(function (u) { return /\.m3u8|master|\.mp4|\.txt(\?|$)|rapidrame|playmix|\/hls/i.test(u); });
+  function rank(u) { return /\.m3u8/i.test(u) ? 0 : (/master/i.test(u) ? 1 : 2); }
+  good.sort(function (a, b) { return rank(a) - rank(b); });
+
+  dbg.push('SB ' + label + ' betik ' + scripts.length + ' kayit ' + box.rec.length + ' aday ' + good.length +
+    (box.errs.length ? ' hata ' + box.errs.slice(0, 2).join('|').slice(0, 110) : ''));
+  good.slice(0, 3).forEach(function (u) { dbg.push('SB A ' + label + ' ' + u.slice(0, 130)); });
+  if (!good.length) box.trace.slice(0, 8).forEach(function (t) { dbg.push('SB T ' + label + ' ' + t.slice(0, 120)); });
+
+  return good.map(function (u) { return { url: u, type: /\.mp4(\?|$)/i.test(u) ? 'mp4' : 'hls', quality: 'Auto' }; });
+}
+
 function resolveEmbed(embedUrl, pageUrl, label) {
   var origin = originOf(embedUrl);
   function fetchEmbed(ua) {
@@ -512,17 +670,41 @@ function resolveEmbed(embedUrl, pageUrl, label) {
   }
   return fetchEmbed(ANDROID_UA).then(function (html) {
     var r = html ? extractEmbed(html, origin) : { found: null, texts: [] };
-    if (r.found) return { r: r, ua: ANDROID_UA };
+    if (r.found) return { r: r, ua: ANDROID_UA, html: html };
     return fetchEmbed(DESKTOP_UA).then(function (html2) {
       var r2 = html2 ? extractEmbed(html2, origin) : { found: null, texts: [] };
-      if (r2.found) { dbg.push('EM ' + label + ' masaustu UA ile bulundu'); return { r: r2, ua: DESKTOP_UA }; }
-      if (!html && !html2) { dbg.push('EM ' + label + ' sayfa bos'); }
-      else { try { embedDiag(label, html || html2, (html ? r : r2).texts); } catch (e) {} }
-      stage = 'embed link çıkmadı (' + label + ')';
-      return null;
+      if (r2.found) { dbg.push('EM ' + label + ' masaustu UA ile bulundu'); return { r: r2, ua: DESKTOP_UA, html: html2 }; }
+      if (!html && !html2) dbg.push('EM ' + label + ' sayfa bos');
+      return { r: html ? r : r2, ua: ANDROID_UA, html: html || html2 || '' };
     });
   }).then(function (o) {
-    if (!o) return null;
+    function viaSandbox(skip, allowUnverified) {
+      if (!o.html) return Promise.resolve(null);
+      var cands = [];
+      try { cands = sandboxFind(o.html, embedUrl, pageUrl, skip, label); } catch (e) { dbg.push('SB hata ' + label + ' ' + (e && e.message)); }
+      var hdrs = { 'User-Agent': o.ua, 'Referer': origin + '/' };
+      function tryC(i) {
+        if (i >= cands.length || i >= 4) {
+          if (allowUnverified && cands.length) { cands[0].headers = hdrs; return Promise.resolve(cands[0]); }
+          return Promise.resolve(null);
+        }
+        var c = cands[i]; c.headers = hdrs;
+        return verifyStream(c, label + ' sb' + i, origin).then(function (v) {
+          return (v.ok || v.type !== 'hls') ? v : tryC(i + 1);
+        });
+      }
+      return tryC(0);
+    }
+
+    if (!o.r.found) {
+      return viaSandbox('', true).then(function (v) {
+        if (v) return v;
+        if (o.html) { try { embedDiag(label, o.html, o.r.texts); } catch (e) {} }
+        stage = 'embed link çıkmadı (' + label + ')';
+        return null;
+      });
+    }
+
     var found = o.r.found;
     found.headers = { 'User-Agent': o.ua, 'Referer': origin + '/' };
     try {
@@ -532,7 +714,10 @@ function resolveEmbed(embedUrl, pageUrl, label) {
         if (ix > -1) { dbg.push('CTX ' + label + ' ' + tt.substr(Math.max(0, ix - 120), 330).replace(/\s+/g, ' ')); break; }
       }
     } catch (e) {}
-    return verifyStream(found, label, origin);
+    return verifyStream(found, label, origin).then(function (v) {
+      if (v.ok || v.type !== 'hls') return v;
+      return viaSandbox(v.url, false).then(function (s) { return s || v; });
+    });
   });
 }
 
@@ -554,7 +739,7 @@ function makeStream(label, r) {
 
 function debugStream(msg) {
   if (!SITE_AYARLARI.DEBUG_MODU) return [];
-  var rows = [msg].concat(dbg.slice(0, 70));
+  var rows = [msg].concat(dbg.slice(0, 100));
   return rows.map(function (r) {
     return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/', quality: 'Auto', provider: PROVIDER_ID };
   });
