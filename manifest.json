@@ -1,18 +1,18 @@
 {
   "name": "abifilm3",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "scrapers": [
     {
       "id": "abifilm3",
       "name": "abifilm3",
       "description": "Türkçe dublaj/altyazılı film ve dizi kaynağı (filmmakinesi)",
-      "version": "1.0.2",
+      "version": "1.0.3",
       "author": "custom",
       "supportedTypes": [
         "movie",
         "tv"
       ],
-      "filename": "Providers/abifilm3.js",
+      "filename": "providers/abifilm3.js",
       "enabled": true,
       "hasSettings": false,
       "formats": [
