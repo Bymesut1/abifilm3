@@ -1,12 +1,12 @@
 {
   "name": "abifilm3",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "scrapers": [
     {
       "id": "abifilm3",
       "name": "abifilm3",
       "description": "Türkçe dublaj/altyazılı film ve dizi kaynağı (filmmakinesi)",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "author": "custom",
       "supportedTypes": [
         "movie",
