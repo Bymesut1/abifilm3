@@ -425,6 +425,74 @@ function embedDiag(label, html, texts) {
   if (ss > -1) dbg.push('EM son: ' + html.substr(ss, 160).replace(/\s+/g, ' '));
 }
 
+// ---------------- Akış doğrulama (oynatma hatasını önlemek için) ----------------
+
+function resolveRel(base, rel) {
+  if (/^https?:\/\//i.test(rel)) return rel;
+  if (rel.indexOf('//') === 0) return 'https:' + rel;
+  if (rel.charAt(0) === '/') return originOf(base) + rel;
+  return base.replace(/[?#].*$/, '').replace(/[^\/]*$/, '') + rel;
+}
+
+function probe(url, headers, range) {
+  var h = {};
+  Object.keys(headers || {}).forEach(function (k) { h[k] = headers[k]; });
+  if (range) h['Range'] = 'bytes=0-1';
+  return withTimeout(fetch(url, { headers: h }), 8000).then(function (res) {
+    if (range) return { status: res.status, text: '' };
+    return withTimeout(res.text(), 8000).then(
+      function (t) { return { status: res.status, text: String(t || '') }; },
+      function () { return { status: res.status, text: '' }; }
+    );
+  }).catch(function (e) { return { status: 0, text: (e && e.message) || 'hata' }; });
+}
+
+function firstUri(text) {
+  var lines = String(text).split(/\r?\n/);
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (l && l.charAt(0) !== '#') return l;
+  }
+  return '';
+}
+
+// Linki gerçekten çekip #EXTM3U mi diye bakar; farklı başlık kombinasyonlarını dener.
+function verifyStream(r, label, origin) {
+  if (r.type !== 'hls') return Promise.resolve(r);
+  dbg.push('U ' + label + ' ' + r.url.slice(0, 110));
+  var variants = [
+    r.headers,
+    { 'User-Agent': ANDROID_UA, 'Referer': origin + '/', 'Origin': origin },
+    { 'User-Agent': ANDROID_UA, 'Referer': SITE_AYARLARI.PRIMARY_DOMAIN + '/', 'Origin': SITE_AYARLARI.PRIMARY_DOMAIN },
+    { 'User-Agent': ANDROID_UA }
+  ];
+  function tryAt(i) {
+    if (i >= variants.length) return Promise.resolve(r);
+    return probe(r.url, variants[i]).then(function (p) {
+      var head = p.text.slice(0, 40).replace(/\s+/g, ' ');
+      dbg.push('V ' + label + ' h' + i + ' ' + p.status + ' ' + head);
+      if (p.status === 200 && /^\s*#EXTM3U/.test(p.text)) {
+        r.headers = variants[i];
+        // ikinci seviye: ilk alt liste / ilk parça erişilebiliyor mu
+        var u1 = firstUri(p.text);
+        if (!u1) return r;
+        u1 = resolveRel(r.url, u1);
+        return probe(u1, variants[i]).then(function (p2) {
+          dbg.push('V2 ' + label + ' ' + p2.status + ' ' + p2.text.slice(0, 30).replace(/\s+/g, ' '));
+          var u2 = /#EXTINF|#EXT-X-MAP/.test(p2.text) ? firstUri(p2.text) : '';
+          if (!u2) return r;
+          return probe(resolveRel(u1, u2), variants[i], true).then(function (p3) {
+            dbg.push('V3 ' + label + ' parca ' + p3.status);
+            return r;
+          });
+        });
+      }
+      return tryAt(i + 1);
+    });
+  }
+  return tryAt(0);
+}
+
 function resolveEmbed(embedUrl, pageUrl, label) {
   var origin = originOf(embedUrl);
   function fetchEmbed(ua) {
@@ -450,7 +518,7 @@ function resolveEmbed(embedUrl, pageUrl, label) {
     if (!o) return null;
     var found = o.r.found;
     found.headers = { 'User-Agent': o.ua, 'Referer': origin + '/' };
-    return found;
+    return verifyStream(found, label, origin);
   });
 }
 
@@ -531,7 +599,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
               streams.push(makeStream(parts[i].label, r));
             }
             if (!streams.length) return debugStream('cozulemedi: ' + stage);
-            return streams;
+            return streams.concat(debugStream('tani: ' + streams.length + ' akis'));
           });
         });
       });
