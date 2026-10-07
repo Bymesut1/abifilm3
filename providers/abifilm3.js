@@ -518,12 +518,45 @@ function sbBtoa(str) {
 }
 function sbAtob(s) { return bytesToStr(b64ToBytes(s)); }
 
+function formEncode(o) {
+  if (typeof o === 'string') return o;
+  var parts = [];
+  Object.keys(o || {}).forEach(function (k) {
+    var v = o[k];
+    if (v && typeof v === 'object') v = JSON.stringify(v);
+    parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(v === undefined || v === null ? '' : v));
+  });
+  return parts.join('&');
+}
+
+var SB_RESERVED = /^(break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|import|in|instanceof|let|new|null|return|super|switch|this|throw|true|try|typeof|var|void|while|with|yield|await|static|implements|interface|package|private|protected|public|arguments|eval|undefined|NaN|Infinity)$/;
+function sbValidName(n) { return /^[A-Za-z_$][\w$]*$/.test(n) && !SB_RESERVED.test(n); }
+function sbMissingName(e) {
+  var msg = String((e && e.message) || e), m;
+  if ((m = msg.match(/['"]?([A-Za-z_$][\w$]*)['"]? is not defined/))) return m[1];
+  if ((m = msg.match(/Can't find variable: ([\w$]+)/))) return m[1];
+  if ((m = msg.match(/Property '([\w$]+)' doesn't exist/))) return m[1];
+  return '';
+}
+function sbDeclNames(code) {
+  var names = {}, m, re = /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)/g;
+  while ((m = re.exec(code)) !== null) names[m[1]] = 1;
+  re = /\bfunction\s+([A-Za-z_$][\w$]*)\s*\(/g;
+  while ((m = re.exec(code)) !== null) names[m[1]] = 1;
+  re = /[;{}]\s*(?:var\s+)?([A-Za-z_$][\w$]*)\s*=(?!=)/g;
+  while ((m = re.exec(code)) !== null) names[m[1]] = 1;
+  return Object.keys(names).filter(sbValidName).slice(0, 400);
+}
+
 function sbNew(embedUrl, pageUrl) {
-  var rec = [], trace = [], errs = [], depth = 0, fired = 0;
+  var rec = [], trace = [], errs = [], reqs = [], queue = [], fired = 0, depth = 0;
+  var G = {};
   var host = (String(embedUrl).match(/^https?:\/\/([^\/?#]+)/) || [])[1] || '';
   var NAMES = ['window', 'document', 'navigator', 'location', '$', 'jQuery', 'jwplayer', 'Hls', 'videojs', 'player',
     'localStorage', 'sessionStorage', 'screen', 'history', 'XMLHttpRequest', 'setTimeout', 'setInterval',
-    'self', 'top', 'parent', 'globalThis', 'Image', 'Audio'];
+    'clearTimeout', 'clearInterval', 'self', 'top', 'parent', 'globalThis', 'Image', 'Audio', 'Element',
+    'HTMLElement', 'Node', 'Event', 'CustomEvent', 'MutationObserver', 'FormData', 'Blob', 'Worker', 'WebSocket',
+    'fetch', 'requestAnimationFrame', 'performance', 'console', 'chrome', 'opera'];
 
   function pv(v) {
     try {
@@ -538,16 +571,18 @@ function sbNew(embedUrl, pageUrl) {
       else if (v && typeof v === 'object') rec.push(JSON.stringify(v));
     } catch (e) {}
   }
-  function fire(fn) {
-    if (fired++ > 150 || depth > 6) return;
-    depth++;
-    try { fn(); } catch (e) { errs.push('cb:' + (e && e.message)); }
-    depth--;
+  function fire(fn) { if (fired++ < 400) queue.push(fn); }
+  function drain() {
+    var n = 0;
+    while (queue.length && n++ < 400) {
+      var f = queue.shift();
+      try { f(); } catch (e) { errs.push('cb:' + (e && e.message)); }
+    }
   }
   function mk(name, init) {
     var store = init || {}, kids = {};
     function handleArgs(args) {
-      if (trace.length < 40) trace.push(name + '(' + args.map(pv).join(',') + ')');
+      if (trace.length < 60) trace.push(name + '(' + args.map(pv).join(',') + ')');
       for (var i = 0; i < args.length; i++) {
         if (typeof args[i] === 'function') fire(args[i]); else add(args[i]);
       }
@@ -566,7 +601,7 @@ function sbNew(embedUrl, pageUrl) {
       set: function (t, k, v) {
         store[k] = v;
         if (typeof v === 'function') fire(v);
-        else { if (trace.length < 40) trace.push(name + '.' + String(k) + '=' + pv(v)); add(v); }
+        else { if (trace.length < 60) trace.push(name + '.' + String(k) + '=' + pv(v)); add(v); }
         return true;
       },
       apply: function (t, th, args) { handleArgs(args); return mk(name + '()'); },
@@ -577,35 +612,80 @@ function sbNew(embedUrl, pageUrl) {
   function rewrite(code) {
     return String(code).replace(/\beval\s*\(/g, '__ev(').replace(/(^|[^\w$.])Function\s*\(/g, '$1__Fn(');
   }
-  function build(params, code, asExpr) {
-    var all = NAMES.concat(['__ev', '__Fn', 'atob', 'btoa']).concat(params || []);
+  var gkeys = [];
+  function build(params, code, asExpr, doExport) {
+    gkeys = Object.keys(G).filter(sbValidName);
+    var all = NAMES.concat(['__ev', '__Fn', 'atob', 'btoa', '__G']).concat(gkeys).concat(params || []);
     var body = rewrite(code);
-    all.push(asExpr ? 'return (' + body + '\n);' : body);
-    return Function.apply(null, all);
+    if (asExpr) body = 'return (' + body + '\n);';
+    else if (doExport) {
+      var ep = sbDeclNames(code).map(function (n) {
+        return 'try{if(typeof ' + n + '!=="undefined")__G["' + n + '"]=' + n + '}catch(_e){}';
+      }).join(';');
+      body = 'try{' + body + '\n}finally{' + ep + '}';
+    }
+    all.push(body);
+    var fn = Function.apply(null, all);
+    fn.__keys = gkeys;
+    return fn;
   }
   var win, vals;
   function call(fn, extra) {
-    return fn.apply(win, vals.concat([sbEval, sbFn, sbAtob, sbBtoa]).concat(extra || []));
+    var keys = fn.__keys || [];
+    var args = vals.concat([sbEval, sbFn, sbAtob, sbBtoa, G]).concat(keys.map(function (k) { return G[k]; })).concat(extra || []);
+    return fn.apply(win, args);
+  }
+  function execCode(code, tryExpr) {
+    var mode = tryExpr ? 'expr' : 'stmt', fn;
+    for (var attempt = 0; attempt < 30; attempt++) {
+      try {
+        if (mode === 'expr') { try { fn = build([], code, true, false); } catch (se) { mode = 'stmt'; } }
+        if (mode === 'stmt') fn = build([], code, false, true);
+        return call(fn);
+      } catch (e) {
+        var nm = sbMissingName(e);
+        if (nm && sbValidName(nm) && NAMES.indexOf(nm) === -1 && !Object.prototype.hasOwnProperty.call(G, nm)) { G[nm] = mk(nm); continue; }
+        throw e;
+      }
+    }
+    return undefined;
   }
   function sbEval(code) {
     if (typeof code !== 'string') return code;
     rec.push(code);
     if (depth > 6) return undefined;
     depth++;
-    try {
-      var fn;
-      try { fn = build([], code, true); } catch (se) { fn = build([], code, false); }
-      return call(fn);
-    } catch (e) { errs.push('ev:' + (e && e.message)); return undefined; }
+    try { return execCode(code, true); }
+    catch (e) { errs.push('ev:' + (e && e.message)); return undefined; }
     finally { depth--; }
   }
   function sbFn() {
     var a = Array.prototype.slice.call(arguments), body = String(a.length ? a.pop() : ''), params = [];
     rec.push(body);
     a.forEach(function (x) { String(x).split(',').forEach(function (q) { q = q.trim(); if (q) params.push(q); }); });
-    var fn = build(params, body, false);
+    var fn = build(params, body, false, false);
     return function () { return call(fn, Array.prototype.slice.call(arguments)); };
   }
+
+  function ajaxHandle(r) {
+    var h = {};
+    ['done', 'then', 'success'].forEach(function (n) { h[n] = function (f) { if (typeof f === 'function') r.cbs.push(f); return h; }; });
+    ['fail', 'always', 'catch', 'error', 'complete'].forEach(function (n) { h[n] = function () { return h; }; });
+    return h;
+  }
+  function addReq(opts) {
+    var r = { opts: opts || {}, cbs: [] };
+    reqs.push(r);
+    if (trace.length < 60) trace.push('ajax ' + pv({ type: r.opts.type || r.opts.method, url: r.opts.url, data: r.opts.data }));
+    return ajaxHandle(r);
+  }
+  var jqInit = {
+    ajax: function (o, o2) { if (typeof o === 'string') { o2 = o2 || {}; o2.url = o; o = o2; } return addReq(o); },
+    post: function (u, d, cb, t) { if (typeof d === 'function') { t = cb; cb = d; d = undefined; } return addReq({ type: 'POST', url: u, data: d, success: cb, dataType: t }); },
+    get: function (u, d, cb, t) { if (typeof d === 'function') { t = cb; cb = d; d = undefined; } return addReq({ type: 'GET', url: u, data: d, success: cb, dataType: t }); },
+    getJSON: function (u, d, cb) { if (typeof d === 'function') { cb = d; d = undefined; } return addReq({ type: 'GET', url: u, data: d, success: cb, dataType: 'json' }); },
+    ajaxSetup: function () {}
+  };
 
   var doc = mk('document', { referrer: pageUrl, cookie: '', URL: embedUrl, domain: host, readyState: 'complete' });
   var nav = mk('navigator', { userAgent: ANDROID_UA, platform: 'Linux armv8l', language: 'tr-TR', webdriver: false });
@@ -616,15 +696,51 @@ function sbNew(embedUrl, pageUrl) {
     if (n === 'document') return doc;
     if (n === 'navigator') return nav;
     if (n === 'location') return loc;
+    if (n === '$' || n === 'jQuery') return mk(n, jqInit);
     return mk(n);
   });
 
   return {
-    rec: rec, trace: trace, errs: errs,
+    rec: rec, trace: trace, errs: errs, reqs: reqs,
     run: function (code) {
-      try { call(build([], code, false)); } catch (e) { errs.push('run:' + (e && e.message)); }
+      try { execCode(code, false); } catch (e) { errs.push('run:' + (e && e.message)); }
+    },
+    drain: drain,
+    feed: function (r, text) {
+      rec.push(text);
+      var o = r.opts || {}, data = text;
+      if (/json/i.test(String(o.dataType || '')) || /^\s*[\[{]/.test(text)) { try { data = JSON.parse(text); } catch (e) { data = text; } }
+      [o.success].concat(r.cbs).forEach(function (f) {
+        if (typeof f !== 'function') return;
+        try { f(data, 'success', {}); } catch (e) { errs.push('aj:' + (e && e.message)); }
+      });
+      drain();
     }
   };
+}
+
+function sbRequests(box, embedUrl, label) {
+  var origin = originOf(embedUrl);
+  return Promise.all(box.reqs.slice(0, 3).map(function (r) {
+    var o = r.opts || {}, method = String(o.type || o.method || 'GET').toUpperCase();
+    var url = resolveRel(embedUrl, String(o.url || ''));
+    var headers = {
+      'User-Agent': ANDROID_UA, 'Referer': embedUrl, 'Origin': origin,
+      'X-Requested-With': 'XMLHttpRequest', 'Accept': '*/*'
+    };
+    var init = { method: method, headers: headers };
+    if (o.data !== undefined && o.data !== null) {
+      var enc = formEncode(o.data);
+      if (method === 'GET') url += (url.indexOf('?') > -1 ? '&' : '?') + enc;
+      else { init.body = enc; headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'; }
+    }
+    return withTimeout(fetch(url, init), 9000).then(function (res) {
+      return withTimeout(res.text(), 9000).then(function (t) { return { status: res.status, text: t || '' }; });
+    }).catch(function (e) { return { status: 0, text: '' }; }).then(function (resp) {
+      dbg.push('AJ ' + label + ' ' + method + ' ' + url.slice(-45) + ' ' + resp.status + '/' + resp.text.length + ' ' + resp.text.slice(0, 110).replace(/\s+/g, ' '));
+      try { box.feed(r, resp.text); } catch (e) { dbg.push('AJ hata ' + (e && e.message)); }
+    });
+  }));
 }
 
 function sandboxFind(html, embedUrl, pageUrl, skip, label) {
@@ -635,27 +751,32 @@ function sandboxFind(html, embedUrl, pageUrl, skip, label) {
   }
   var box = sbNew(embedUrl, pageUrl);
   scripts.forEach(function (sc) { box.run(sc); });
+  box.drain();
 
-  var urls = [], seen = {};
-  box.rec.forEach(function (x) {
-    var t = hexUnescape(String(x)).replace(/&amp;/g, '&');
-    (t.match(/https?:\/\/[^\s"'<>\\)\]]+/g) || []).forEach(function (u) {
-      u = u.replace(/[,;]+$/, '');
-      if (seen[u] || u === skip || BAD_EXT.test(u)) return;
-      if (/googleapis|gstatic|jquery|cdnjs|jsdelivr|jwplayer|jwpcdn|schema\.org|w3\.org|youtube|cloudflare|google/i.test(u)) return;
-      seen[u] = true; urls.push(u);
+  return sbRequests(box, embedUrl, label).then(function () {
+    var urls = [], seen = {};
+    box.rec.forEach(function (x) {
+      var t = hexUnescape(String(x)).replace(/&amp;/g, '&');
+      (t.match(/https?:\/\/[^\s"'<>\\)\]]+/g) || []).forEach(function (u) {
+        u = u.replace(/[,;]+$/, '');
+        if (seen[u] || u === skip || BAD_EXT.test(u)) return;
+        if (/googleapis|gstatic|jquery|cdnjs|jsdelivr|jwplayer|jwpcdn|schema\.org|w3\.org|youtube|cloudflare|google/i.test(u)) return;
+        seen[u] = true; urls.push(u);
+      });
     });
+    var good = urls.filter(function (u) { return /\.m3u8|master|\.mp4|\.txt(\?|$)|rapidrame|playmix|\/hls/i.test(u); });
+    function rank(u) { return /\.m3u8/i.test(u) ? 0 : (/master/i.test(u) ? 1 : 2); }
+    good.sort(function (a, b) { return rank(a) - rank(b); });
+
+    dbg.push('SB ' + label + ' betik ' + scripts.length + ' kayit ' + box.rec.length + ' istek ' + box.reqs.length + ' aday ' + good.length +
+      (box.errs.length ? ' hata ' + box.errs.slice(0, 3).join('|').slice(0, 150) : ''));
+    good.slice(0, 3).forEach(function (u) { dbg.push('SB A ' + label + ' ' + u.slice(0, 130)); });
+    if (!good.length) {
+      var key = box.trace.filter(function (t) { return /setup|ajax|file|src|http|source|play/i.test(t); });
+      (key.length ? key : box.trace).slice(0, 8).forEach(function (t) { dbg.push('SB T ' + label + ' ' + t.slice(0, 130)); });
+    }
+    return good.map(function (u) { return { url: u, type: /\.mp4(\?|$)/i.test(u) ? 'mp4' : 'hls', quality: 'Auto' }; });
   });
-  var good = urls.filter(function (u) { return /\.m3u8|master|\.mp4|\.txt(\?|$)|rapidrame|playmix|\/hls/i.test(u); });
-  function rank(u) { return /\.m3u8/i.test(u) ? 0 : (/master/i.test(u) ? 1 : 2); }
-  good.sort(function (a, b) { return rank(a) - rank(b); });
-
-  dbg.push('SB ' + label + ' betik ' + scripts.length + ' kayit ' + box.rec.length + ' aday ' + good.length +
-    (box.errs.length ? ' hata ' + box.errs.slice(0, 2).join('|').slice(0, 110) : ''));
-  good.slice(0, 3).forEach(function (u) { dbg.push('SB A ' + label + ' ' + u.slice(0, 130)); });
-  if (!good.length) box.trace.slice(0, 8).forEach(function (t) { dbg.push('SB T ' + label + ' ' + t.slice(0, 120)); });
-
-  return good.map(function (u) { return { url: u, type: /\.mp4(\?|$)/i.test(u) ? 'mp4' : 'hls', quality: 'Auto' }; });
 }
 
 function resolveEmbed(embedUrl, pageUrl, label) {
@@ -680,20 +801,23 @@ function resolveEmbed(embedUrl, pageUrl, label) {
   }).then(function (o) {
     function viaSandbox(skip, allowUnverified) {
       if (!o.html) return Promise.resolve(null);
-      var cands = [];
-      try { cands = sandboxFind(o.html, embedUrl, pageUrl, skip, label); } catch (e) { dbg.push('SB hata ' + label + ' ' + (e && e.message)); }
       var hdrs = { 'User-Agent': o.ua, 'Referer': origin + '/' };
-      function tryC(i) {
-        if (i >= cands.length || i >= 4) {
-          if (allowUnverified && cands.length) { cands[0].headers = hdrs; return Promise.resolve(cands[0]); }
-          return Promise.resolve(null);
+      return sandboxFind(o.html, embedUrl, pageUrl, skip, label).catch(function (e) {
+        dbg.push('SB hata ' + label + ' ' + (e && e.message));
+        return [];
+      }).then(function (cands) {
+        function tryC(i) {
+          if (i >= cands.length || i >= 4) {
+            if (allowUnverified && cands.length) { cands[0].headers = hdrs; return Promise.resolve(cands[0]); }
+            return Promise.resolve(null);
+          }
+          var c = cands[i]; c.headers = hdrs;
+          return verifyStream(c, label + ' sb' + i, origin).then(function (v) {
+            return (v.ok || v.type !== 'hls') ? v : tryC(i + 1);
+          });
         }
-        var c = cands[i]; c.headers = hdrs;
-        return verifyStream(c, label + ' sb' + i, origin).then(function (v) {
-          return (v.ok || v.type !== 'hls') ? v : tryC(i + 1);
-        });
-      }
-      return tryC(0);
+        return tryC(0);
+      });
     }
 
     if (!o.r.found) {
