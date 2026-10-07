@@ -421,6 +421,13 @@ function embedDiag(label, html, texts) {
   if (srcs.length) dbg.push('EM js: ' + srcs.join(' , '));
   var i = t.search(/av\s*\(|atob\(|m3u8|"file"/);
   if (i > -1) dbg.push('EM ipucu: ' + t.substr(Math.max(0, i - 40), 160).replace(/\s+/g, ' '));
+  dbg.push('EM paketLen ' + t.length);
+  var dumpFrom = Math.max(0, t.search(/atob\(/) - 700);
+  for (var ci = 0; ci < 10; ci++) {
+    var chunk = t.substr(dumpFrom + ci * 320, 320).replace(/\s+/g, ' ');
+    if (!chunk) break;
+    dbg.push('EM K' + ci + ': ' + chunk);
+  }
   var ss = html.lastIndexOf('<script');
   if (ss > -1) dbg.push('EM son: ' + html.substr(ss, 160).replace(/\s+/g, ' '));
 }
@@ -518,6 +525,13 @@ function resolveEmbed(embedUrl, pageUrl, label) {
     if (!o) return null;
     var found = o.r.found;
     found.headers = { 'User-Agent': o.ua, 'Referer': origin + '/' };
+    try {
+      var key = found.url.slice(0, 45);
+      for (var ti = 0; ti < o.r.texts.length; ti++) {
+        var tt = hexUnescape(o.r.texts[ti]), ix = tt.indexOf(key);
+        if (ix > -1) { dbg.push('CTX ' + label + ' ' + tt.substr(Math.max(0, ix - 120), 330).replace(/\s+/g, ' ')); break; }
+      }
+    } catch (e) {}
     return verifyStream(found, label, origin);
   });
 }
@@ -540,7 +554,7 @@ function makeStream(label, r) {
 
 function debugStream(msg) {
   if (!SITE_AYARLARI.DEBUG_MODU) return [];
-  var rows = [msg].concat(dbg.slice(0, 40));
+  var rows = [msg].concat(dbg.slice(0, 70));
   return rows.map(function (r) {
     return { name: 'DEBUG ' + r, title: 'DEBUG ' + r, url: 'https://debug.invalid/', quality: 'Auto', provider: PROVIDER_ID };
   });
@@ -586,6 +600,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
           if (!pg.html) return debugStream('bolum sayfasi bos: ' + pg.url);
           var parts = extractParts(pg.html);
           dbg.push('kaynak ' + parts.length);
+          parts.forEach(function (p) { dbg.push('P ' + p.label + ' ' + p.url.slice(0, 150)); });
           if (!parts.length) return debugStream('kaynak yok');
 
           return Promise.all(parts.map(function (p) {
